@@ -46,49 +46,49 @@ func OutputTransformType(row map[string]interface{}) map[string]interface{} {
 		case []int64:
 			row[k] = cast.ToStringSlice(v)
 		case map[string]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[int64]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[int32]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[int16]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[int8]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[float64]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[float32]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val
 			}
 		case map[bool]int64:
-			val, err := cast.FToStringMapStringE(v)
+			val, err := fToStringMapStringE(v)
 
 			if err == nil {
 				row[k] = val

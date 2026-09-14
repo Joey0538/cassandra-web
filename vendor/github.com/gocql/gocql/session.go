@@ -187,6 +187,11 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	return s, nil
 }
 
+// GetHosts exposes the session's host list.
+//
+// LOCAL PATCH, not upstream gocql. Re-apply after any `go mod vendor` or gocql
+// bump; the /hostinfo endpoint needs it. hostSource is unexported, so there is
+// no way to reach this from outside the package.
 func (s *Session) GetHosts() ([]*HostInfo, error) {
 	h, _, err := s.hostSource.GetHosts()
 
