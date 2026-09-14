@@ -715,42 +715,16 @@ func (h *Handler) Delete(c echo.Context) error {
 
 	schema := h.GetSchema(req.Table)
 
-	var (
-		partitionCql    []string
-		clusteringCql   []string
-		partitionValue  []interface{}
-		clusteringValue []interface{}
-	)
-
-	for _, v := range schema {
-		kind := v["kind"].(string)
-		columnName := v["column_name"].(string)
-		columnType := v["type"].(string)
-
-		if kind == PartitionKey {
-			val, err := cqlFormatValue(h.converterFor(req.Table), columnType, item[columnName])
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
-			}
-
-			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
-			partitionValue = append(partitionValue, val)
-		} else if kind == ClusteringKey {
-			val, err := cqlFormatValue(h.converterFor(req.Table), columnType, item[columnName])
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
-			}
-
-			clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, "="))
-			clusteringValue = append(clusteringValue, val)
-		}
+	where, whereValue, err := deleteWhere(h.converterFor(req.Table), schema, item)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
-	cql := fmt.Sprintf("DELETE FROM %s WHERE %s ", req.Table, strings.Join(append(partitionCql, clusteringCql...), " AND "))
+	cql := fmt.Sprintf("DELETE FROM %s WHERE %s ", req.Table, where)
 
-	log.Info("delete cql: ", cql, append(partitionValue, clusteringValue...))
+	log.Info("delete cql: ", cql, whereValue)
 
-	if err := h.Session.Query(cql, append(partitionValue, clusteringValue...)...).Exec(); err != nil {
+	if err := h.Session.Query(cql, whereValue...).Exec(); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
@@ -1112,6 +1086,67 @@ func (h *Handler) Truncate(c echo.Context) error {
 }
 
 // GetSchema 取的table schema
+// deleteWhere identifies the row to delete. A row is identified by its
+// partition key plus the clustering keys it actually has: the static row left
+// behind when a partition's last clustering row is deleted has none, and CQL
+// rejects a null in a WHERE clause, so those columns are left out instead of
+// bound as null. Deleting that row then removes the whole partition, which is
+// what clears the static columns. Clustering keys stop at the first missing
+// one, because CQL only accepts a contiguous prefix.
+func deleteWhere(conv converter, schema []map[string]interface{}, item map[string]interface{}) (string, []interface{}, error) {
+	var (
+		partitionCql    []string
+		partitionValue  []interface{}
+		clusteringCql   []string
+		clusteringValue []interface{}
+		clusteringEnded bool
+	)
+
+	for _, v := range schema {
+		kind := v["kind"].(string)
+		if kind != PartitionKey && kind != ClusteringKey {
+			continue
+		}
+
+		columnName := v["column_name"].(string)
+		columnType := v["type"].(string)
+
+		val, err := cqlFormatValue(conv, columnType, item[columnName])
+		if err != nil {
+			return "", nil, fmt.Errorf("%s: %w", columnName, err)
+		}
+
+		if kind == PartitionKey {
+			if val == nil {
+				return "", nil, fmt.Errorf("%s: a row cannot be deleted without its partition key", columnName)
+			}
+
+			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
+			partitionValue = append(partitionValue, val)
+			continue
+		}
+
+		if val == nil {
+			clusteringEnded = true
+			continue
+		}
+
+		if clusteringEnded {
+			continue
+		}
+
+		clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, "="))
+		clusteringValue = append(clusteringValue, val)
+	}
+
+	if len(partitionCql) == 0 {
+		return "", nil, fmt.Errorf("a row cannot be deleted without its partition key")
+	}
+
+	return strings.Join(append(partitionCql, clusteringCql...), " AND "),
+		append(partitionValue, clusteringValue...), nil
+}
+
 func hasCounterColumn(schema map[string]string) bool {
 	for _, t := range schema {
 		if t == CounterType {
