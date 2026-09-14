@@ -21,6 +21,7 @@ import (
 	"github.com/labstack/echo"
 	// "github.com/labstack/echo/middleware"
 	"github.com/labstack/gommon/log"
+	"github.com/spf13/cast"
 	"github.com/spf13/viper"
 	"github.com/tidwall/gjson"
 	"github.com/urfave/cli"
@@ -128,6 +129,9 @@ func run(c *cli.Context) {
 	cluster.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 20}
 	cluster.NumConns = 10
 	cluster.Consistency = gocql.One
+	// Pinned so the wire framing the row decoder relies on is not left to
+	// negotiation: collection and element lengths are int32 from protocol v3 on.
+	cluster.ProtoVersion = 4
 
 	if env.CassandraUsername != "" && env.CassandraPassword != "" {
 		cluster.Authenticator = gocql.PasswordAuthenticator{
@@ -148,6 +152,13 @@ func run(c *cli.Context) {
 
 	// Echo instance
 	e := echo.New()
+
+	// Last line of defence. A decode failure used to panic out of the handler
+	// goroutine, and with no recover middleware net/http killed the connection
+	// mid-response: the UI drew an empty table and reported no error, which is
+	// indistinguishable from a genuinely empty one. Any panic now surfaces as a
+	// 500 the caller can see.
+	e.Use(recoverMiddleware)
 
 	// e.Use(middleware.Logger())
 
@@ -218,7 +229,7 @@ func (h *Handler) Query(c echo.Context) error {
 
 		iter := h.Session.Query(q).Iter()
 
-		ret, err := iter.SliceMap()
+		ret, err := SafeSliceMap(iter)
 
 		for _, k := range ret {
 			row := make(map[string]interface{})
@@ -440,8 +451,8 @@ func (h *Handler) FirstQuery(req *RowTokenReq, schema []map[string]interface{}) 
 	rowIter := h.Session.Query(cql, append(pCqlColumnValue, cCqlColumnValue...)...).Iter()
 
 	for {
-		row := make(map[string]interface{})
-		if !rowIter.MapScan(row) {
+		row, ok := SafeMapScan(rowIter)
+		if !ok {
 			break
 		}
 		rowData = append(rowData, OutputTransformType(row))
@@ -492,8 +503,8 @@ func (h *Handler) SecondQuery(req *RowTokenReq, schema []map[string]interface{},
 	rowIter := h.Session.Query(cql, pCqlColumnValue...).Iter()
 
 	for {
-		row := make(map[string]interface{})
-		if !rowIter.MapScan(row) {
+		row, ok := SafeMapScan(rowIter)
+		if !ok {
 			break
 		}
 		rowData = append(rowData, OutputTransformType(row))
@@ -537,8 +548,8 @@ func (h *Handler) Row(c echo.Context) error {
 	for {
 		i++
 
-		row := make(map[string]interface{})
-		if !rowIter.MapScan(row) {
+		row, ok := SafeMapScan(rowIter)
+		if !ok {
 			break
 		}
 		if i > limit_start {
@@ -565,28 +576,32 @@ func (h *Handler) Describe(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Invalid table name")
 	}
 
+	// Served over CQL rather than by shelling out to cqlsh. DESCRIBE became a
+	// native statement in Cassandra 4.0 (CASSANDRA-14825), and the cqlsh this
+	// image used to bundle is no longer installable: its tarball 404s and it
+	// needs python2, which Alpine dropped after 3.16.
 	cql := fmt.Sprintf("DESCRIBE %s ;", table)
 
-	cmdSlice := make([]string, 0)
-	cmdSlice = append(cmdSlice, strings.Split(env.CassandraHost, ",")[0], "-e", cql)
+	iter := h.Session.Query(cql).Iter()
 
-	if env.CassandraUsername != "" {
-		cmdSlice = append(cmdSlice, "-u", env.CassandraUsername)
+	var statements []string
+
+	for {
+		row, ok := SafeMapScan(iter)
+		if !ok {
+			break
+		}
+		if stmt, found := row["create_statement"]; found && stmt != nil {
+			statements = append(statements, cast.ToString(stmt))
+		}
 	}
 
-	if env.CassandraPassword != "" {
-		cmdSlice = append(cmdSlice, "-p", env.CassandraPassword)
+	if err := iter.Close(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError,
+			fmt.Sprintf("describe %s: %s (native DESCRIBE needs Cassandra 4.0 or newer)", table, err.Error()))
 	}
 
-	cmd := exec.Command("cqlsh", cmdSlice...)
-	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8")
-	out, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.String(http.StatusOK, string(out))
+	return c.String(http.StatusOK, strings.Join(statements, "\n\n"))
 }
 
 // Columns 取的tabel欄位處理
@@ -840,8 +855,8 @@ func (h *Handler) Find(c echo.Context) error {
 	for {
 		i++
 
-		row := make(map[string]interface{})
-		if !rowIter.MapScan(row) {
+		row, ok := SafeMapScan(rowIter)
+		if !ok {
 			break
 		}
 		if i > limit_start {
@@ -1063,4 +1078,18 @@ func (h *Handler) GetSchema(table string) []map[string]interface{} {
 	})
 
 	return ret
+}
+
+// recoverMiddleware turns a panic in any handler into a visible 500 instead of
+// a dropped connection.
+func recoverMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("panic serving ", c.Request().RequestURI, ": ", r)
+				err = echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("%v", r))
+			}
+		}()
+		return next(c)
+	}
 }
