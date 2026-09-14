@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"math/big"
 	"os"
 	"regexp"
 
 	"github.com/spf13/cast"
+	"gopkg.in/inf.v0"
 )
 
 const (
@@ -39,9 +41,17 @@ const (
 // OutputTransformType Map Value 數值轉字串
 func OutputTransformType(row map[string]interface{}) map[string]interface{} {
 	for k, v := range row {
-		switch v.(type) {
+		switch typed := v.(type) {
 		case int64, float64, float32:
 			row[k] = cast.ToString(v)
+		case *big.Int:
+			// A varint wider than a float64 loses digits in the browser's
+			// JSON.parse, so it is served as a string like bigint already is.
+			row[k] = typed.String()
+		case big.Int:
+			row[k] = typed.String()
+		case *inf.Dec:
+			row[k] = typed.String()
 		case []int64:
 			row[k] = cast.ToStringSlice(v)
 		case map[string]int64:

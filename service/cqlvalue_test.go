@@ -218,3 +218,42 @@ func TestToCQLValue_UnparseableIsAnError(t *testing.T) {
 		}
 	}
 }
+
+// json-bigint re-serializes a wide number in exponential form, so the exact
+// digits arrive as something like 1.2345678901234567890123456789e+29.
+func TestToCQLValue_ExponentialNotation(t *testing.T) {
+	const huge = "123456789012345678901234567890"
+
+	got, err := toCQLValue(VarintType, "1.2345678901234567890123456789e+29")
+	if err != nil {
+		t.Fatalf("varint exponential: %v", err)
+	}
+	bi, ok := got.(*big.Int)
+	if !ok || bi.String() != huge {
+		t.Fatalf("varint exponential: got %v (%T), want %s", got, got, huge)
+	}
+
+	got, err = toCQLValue(VarintType, "-1.2345678901234567890123456789e+29")
+	if err != nil {
+		t.Fatalf("negative varint exponential: %v", err)
+	}
+	if got.(*big.Int).String() != "-"+huge {
+		t.Fatalf("negative varint exponential: got %v", got)
+	}
+
+	got, err = toCQLValue(DecimalType, "1.23456789e+5")
+	if err != nil {
+		t.Fatalf("decimal exponential: %v", err)
+	}
+	if got.(*inf.Dec).String() != "123456.789" {
+		t.Fatalf("decimal exponential: got %v, want 123456.789", got)
+	}
+
+	// A fractional value is not a valid varint and must still be rejected.
+	if _, err := toCQLValue(VarintType, "1.5e1"); err != nil {
+		t.Fatalf("15 is integral: %v", err)
+	}
+	if _, err := toCQLValue(VarintType, "1.5e0"); err == nil {
+		t.Fatal("1.5 is not a varint, expected an error")
+	}
+}

@@ -220,6 +220,47 @@ func parseBlob(v interface{}) ([]byte, error) {
 	return nil, fmt.Errorf("cannot read %T as a blob", v)
 }
 
+// expandExponent rewrites scientific notation into plain decimal digits.
+// json-bigint re-serializes a wide varint or decimal as 1.23...e+29, which
+// neither big.Int nor inf.Dec will parse.
+func expandExponent(s string) string {
+	i := strings.IndexAny(s, "eE")
+	if i < 0 {
+		return s
+	}
+
+	mantissa, expPart := s[:i], s[i+1:]
+	exp, err := strconv.Atoi(strings.TrimPrefix(expPart, "+"))
+	if err != nil {
+		return s
+	}
+
+	sign := ""
+	if strings.HasPrefix(mantissa, "-") || strings.HasPrefix(mantissa, "+") {
+		if mantissa[0] == '-' {
+			sign = "-"
+		}
+		mantissa = mantissa[1:]
+	}
+
+	intPart, fracPart, _ := strings.Cut(mantissa, ".")
+	digits := intPart + fracPart
+	if digits == "" {
+		return s
+	}
+
+	// The decimal point sits after pointPos digits once the exponent is applied.
+	pointPos := len(intPart) + exp
+	switch {
+	case pointPos <= 0:
+		return sign + "0." + strings.Repeat("0", -pointPos) + digits
+	case pointPos >= len(digits):
+		return sign + digits + strings.Repeat("0", pointPos-len(digits))
+	default:
+		return sign + digits[:pointPos] + "." + digits[pointPos:]
+	}
+}
+
 // toCQLValue converts a JSON-decoded cell into the Go type gocql binds for
 // cqlType. It is the single conversion used by every write path, so an edit and
 // a delete can never disagree about what a column's value means.
@@ -286,7 +327,7 @@ func toCQLValue(cqlType string, v interface{}) (interface{}, error) {
 			return nil, fmt.Errorf("cannot read %T as a decimal", v)
 		}
 		dec := new(inf.Dec)
-		if _, ok := dec.SetString(strings.TrimSpace(s)); !ok {
+		if _, ok := dec.SetString(expandExponent(strings.TrimSpace(s))); !ok {
 			return nil, fmt.Errorf("cannot parse %q as a decimal", s)
 		}
 		return dec, nil
@@ -296,8 +337,18 @@ func toCQLValue(cqlType string, v interface{}) (interface{}, error) {
 		if !ok {
 			return nil, fmt.Errorf("cannot read %T as a varint", v)
 		}
+		expanded := expandExponent(strings.TrimSpace(s))
+		if intPart, frac, hasFrac := strings.Cut(expanded, "."); hasFrac {
+			// An exponent can leave a zero fraction (1.5e1 is the varint 15);
+			// anything else is not a whole number.
+			if strings.Trim(frac, "0") != "" {
+				return nil, fmt.Errorf("cannot parse %q as a varint: not a whole number", s)
+			}
+			expanded = intPart
+		}
+
 		bi := new(big.Int)
-		if _, ok := bi.SetString(strings.TrimSpace(s), 10); !ok {
+		if _, ok := bi.SetString(expanded, 10); !ok {
 			return nil, fmt.Errorf("cannot parse %q as a varint", s)
 		}
 		return bi, nil
