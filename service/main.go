@@ -46,12 +46,10 @@ func init() {
 				*(*interface{})(ptr) = i
 				return
 			}
-			f, err := strconv.ParseFloat(string(number), 64)
-			if err == nil {
-				*(*interface{})(ptr) = f
-				return
-			}
-			// Not much we can do here.
+			// Anything wider than an int64 keeps its digits as a
+			// json.Number; going through float64 silently rewrote large
+			// varints and decimals into a different value.
+			*(*interface{})(ptr) = number
 		default:
 			*(*interface{})(ptr) = iter.Read()
 		}
@@ -429,11 +427,25 @@ func (h *Handler) FirstQuery(req *RowTokenReq, schema []map[string]interface{}) 
 
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
-				pCqlColumnValue = append(pCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					pCqlColumnValue = append(pCqlColumnValue, val)
+				}
 				pCqlPlaceholder = append(pCqlPlaceholder, "?")
 			} else if kind == ClusteringKey {
 				cCqlColumnName = append(cCqlColumnName, columnName)
-				cCqlColumnValue = append(cCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					cCqlColumnValue = append(cCqlColumnValue, val)
+				}
 				cCqlPlaceholder = append(cCqlPlaceholder, "?")
 			}
 		}
@@ -489,7 +501,14 @@ func (h *Handler) SecondQuery(req *RowTokenReq, schema []map[string]interface{},
 
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
-				pCqlColumnValue = append(pCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					pCqlColumnValue = append(pCqlColumnValue, val)
+				}
 				pCqlPlaceholder = append(pCqlPlaceholder, "?")
 			}
 		}
@@ -699,11 +718,21 @@ func (h *Handler) Delete(c echo.Context) error {
 		columnType := v["type"].(string)
 
 		if kind == PartitionKey {
+			val, err := cqlFormatValue(columnType, item[columnName])
+			if err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+			}
+
 			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
-			partitionValue = append(partitionValue, cqlFormatValue(columnType, item[columnName]))
+			partitionValue = append(partitionValue, val)
 		} else if kind == ClusteringKey {
+			val, err := cqlFormatValue(columnType, item[columnName])
+			if err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+			}
+
 			clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, "="))
-			clusteringValue = append(clusteringValue, cqlFormatValue(columnType, item[columnName]))
+			clusteringValue = append(clusteringValue, val)
 		}
 	}
 
@@ -792,11 +821,25 @@ func (h *Handler) Find(c echo.Context) error {
 
 				partitionCql = append(partitionCql, cql)
 				for _, v := range value.Array() {
-					partitionValue = append(partitionValue, cqlFormatValue(columnType, v.Value()))
+					{
+						val, err := cqlFormatValue(columnType, v.Value())
+						if err != nil {
+							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+						}
+
+						partitionValue = append(partitionValue, val)
+					}
 				}
 			} else {
 				partitionCql = append(partitionCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
-				partitionValue = append(partitionValue, cqlFormatValue(columnType, req.Item[columnName]["value"]))
+				{
+					val, err := cqlFormatValue(columnType, req.Item[columnName]["value"])
+					if err != nil {
+						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+					}
+
+					partitionValue = append(partitionValue, val)
+				}
 			}
 
 		} else if kind == ClusteringKey || req.IsAllowFilter {
@@ -818,11 +861,25 @@ func (h *Handler) Find(c echo.Context) error {
 
 				clusteringCql = append(clusteringCql, cql)
 				for _, v := range value.Array() {
-					clusteringValue = append(clusteringValue, cqlFormatValue(columnType, v.Value()))
+					{
+						val, err := cqlFormatValue(columnType, v.Value())
+						if err != nil {
+							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+						}
+
+						clusteringValue = append(clusteringValue, val)
+					}
 				}
 			} else {
 				clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
-				clusteringValue = append(clusteringValue, cqlFormatValue(columnType, req.Item[columnName]["value"]))
+				{
+					val, err := cqlFormatValue(columnType, req.Item[columnName]["value"])
+					if err != nil {
+						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+					}
+
+					clusteringValue = append(clusteringValue, val)
+				}
 			}
 		}
 	}
