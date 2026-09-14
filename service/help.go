@@ -110,8 +110,8 @@ func OutputTransformType(row map[string]interface{}) map[string]interface{} {
 }
 
 // cqlFormatValue converts a filter or primary-key value for binding.
-func cqlFormatValue(columnType string, columnVal interface{}) (interface{}, error) {
-	return toCQLValue(columnType, columnVal)
+func cqlFormatValue(conv converter, columnType string, columnVal interface{}) (interface{}, error) {
+	return conv.value(columnType, columnVal)
 }
 
 func cqlFormatWhere(columnName string, operator string) string {
@@ -122,7 +122,7 @@ var mapReg = regexp.MustCompile(`(?U)^map\<(.+),\s(.+)\>`)
 var listReg = regexp.MustCompile(`(?U)^list\<(.+)>`)
 
 // InputTransformType 對應table schema型別作轉換
-func InputTransformType(item map[string]interface{}, schema map[string]string) ([]string, []interface{}, []string, error) {
+func InputTransformType(conv converter, item map[string]interface{}, schema map[string]string) ([]string, []interface{}, []string, error) {
 	var (
 		itemKey         []string
 		itemData        []interface{}
@@ -130,7 +130,19 @@ func InputTransformType(item map[string]interface{}, schema map[string]string) (
 	)
 
 	for k, v := range item {
-		val, err := toCQLValue(schema[k], v)
+		// A tuple cannot be bound, so it goes into the statement as CQL text.
+		if isTupleType(schema[k]) {
+			lit, err := conv.literal(schema[k], v)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("%s: %w", k, err)
+			}
+
+			itemKey = append(itemKey, k)
+			itemPlaceholder = append(itemPlaceholder, lit)
+			continue
+		}
+
+		val, err := conv.value(schema[k], v)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("%s: %w", k, err)
 		}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gocql/gocql"
 	"gopkg.in/inf.v0"
 )
 
@@ -261,10 +262,83 @@ func expandExponent(s string) string {
 	}
 }
 
-// toCQLValue converts a JSON-decoded cell into the Go type gocql binds for
+// udtField is one field of a user-defined type, in declaration order.
+type udtField struct {
+	Name string
+	Type string
+}
+
+// udtSchema resolves a user-defined type's fields. Implemented by Handler
+// against system_schema.types.
+type udtSchema interface {
+	UDTFields(keyspace, typeName string) ([]udtField, bool)
+}
+
+// converter turns JSON-decoded cells into the Go types gocql binds. It carries
+// the keyspace so an unrecognised type name can be looked up as a UDT.
+type converter struct {
+	keyspace string
+	udts     udtSchema
+}
+
+// toCQLValue converts without UDT resolution, for callers that have no session.
+func toCQLValue(cqlType string, v interface{}) (interface{}, error) {
+	return converter{}.value(cqlType, v)
+}
+
+// udtFields resolves cqlType as a user-defined type, if it is one.
+func (c converter) udtFields(cqlType string) ([]udtField, bool) {
+	if c.udts == nil || c.keyspace == "" {
+		return nil, false
+	}
+	return c.udts.UDTFields(c.keyspace, baseCQLType(cqlType))
+}
+
+// udtValue converts each field against its declared type. gocql marshals a
+// map[string]interface{} field by field, so a timestamp inside a UDT has to
+// already be epoch milliseconds by the time it gets there.
+func (c converter) udtValue(fields []udtField, v interface{}) (interface{}, error) {
+	src, err := asStringMap(v)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]interface{}, len(fields))
+	for _, f := range fields {
+		raw, present := src[f.Name]
+		if !present {
+			continue
+		}
+
+		val, err := c.value(f.Type, raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f.Name, err)
+		}
+		out[f.Name] = val
+	}
+	return out, nil
+}
+
+// asStringMap accepts either a decoded object or the JSON text the read path
+// produces for a UDT used as a map key.
+func asStringMap(v interface{}) (map[string]interface{}, error) {
+	switch m := v.(type) {
+	case map[string]interface{}:
+		return m, nil
+	case string:
+		var decoded map[string]interface{}
+		if err := json.Unmarshal([]byte(m), &decoded); err != nil {
+			return nil, fmt.Errorf("cannot read %q as a user-defined type: %w", m, err)
+		}
+		return decoded, nil
+	}
+	return nil, fmt.Errorf("cannot read %T as a user-defined type", v)
+}
+
+// value converts a JSON-decoded cell into the Go type gocql binds for
 // cqlType. It is the single conversion used by every write path, so an edit and
 // a delete can never disagree about what a column's value means.
-func toCQLValue(cqlType string, v interface{}) (interface{}, error) {
+func (c converter) value(cqlType string, v interface{}) (interface{}, error) {
 	if isBlank(v) {
 		return nil, nil
 	}
@@ -370,28 +444,32 @@ func toCQLValue(cqlType string, v interface{}) (interface{}, error) {
 		if len(args) != 1 {
 			return v, nil
 		}
-		return toCQLList(v, args[0])
+		return c.list(v, args[0])
 
 	case MapType:
 		args := collectionArgs(cqlType)
 		if len(args) != 2 {
 			return v, nil
 		}
-		return toCQLMap(v, args[0], args[1])
+		return c.mapValue(v, args[0], args[1])
 	}
 
-	// UDTs and tuples keep their decoded shape; gocql handles them from there.
+	if fields, ok := c.udtFields(cqlType); ok {
+		return c.udtValue(fields, v)
+	}
+
+	// Tuples and anything unrecognised keep their decoded shape.
 	return v, nil
 }
 
-func toCQLList(v interface{}, elemType string) (interface{}, error) {
+func (c converter) list(v interface{}, elemType string) (interface{}, error) {
 	items, ok := v.([]interface{})
 	if !ok {
 		return v, nil
 	}
 	out := make([]interface{}, 0, len(items))
 	for i, item := range items {
-		converted, err := toCQLValue(elemType, item)
+		converted, err := c.value(elemType, item)
 		if err != nil {
 			return nil, fmt.Errorf("element %d: %w", i, err)
 		}
@@ -400,19 +478,19 @@ func toCQLList(v interface{}, elemType string) (interface{}, error) {
 	return out, nil
 }
 
-func toCQLMap(v interface{}, keyType, valType string) (interface{}, error) {
+func (c converter) mapValue(v interface{}, keyType, valType string) (interface{}, error) {
 	out := map[interface{}]interface{}{}
 
 	switch m := v.(type) {
 	case map[string]interface{}:
 		for k, val := range m {
-			if err := putCQLMapEntry(out, k, val, keyType, valType); err != nil {
+			if err := c.putMapEntry(out, k, val, keyType, valType); err != nil {
 				return nil, err
 			}
 		}
 	case map[interface{}]interface{}:
 		for k, val := range m {
-			if err := putCQLMapEntry(out, k, val, keyType, valType); err != nil {
+			if err := c.putMapEntry(out, k, val, keyType, valType); err != nil {
 				return nil, err
 			}
 		}
@@ -422,15 +500,42 @@ func toCQLMap(v interface{}, keyType, valType string) (interface{}, error) {
 	return out, nil
 }
 
-func putCQLMapEntry(out map[interface{}]interface{}, k, val interface{}, keyType, valType string) error {
-	key, err := toCQLValue(keyType, k)
+func (c converter) putMapEntry(out map[interface{}]interface{}, k, val interface{}, keyType, valType string) error {
+	key, err := c.value(keyType, k)
 	if err != nil {
 		return fmt.Errorf("map key %v: %w", k, err)
 	}
-	value, err := toCQLValue(valType, val)
+	value, err := c.value(valType, val)
 	if err != nil {
 		return fmt.Errorf("map value for key %v: %w", k, err)
 	}
+	if m, isMap := key.(map[string]interface{}); isMap {
+		// A Go map cannot be keyed by a map, so the UDT rides in as a pointer,
+		// which is comparable, and hands gocql its fields via UDTMarshaler.
+		out[&udtMapKey{fields: m}] = value
+		return nil
+	}
+
 	out[key] = value
 	return nil
+}
+
+// udtMapKey carries an already-converted UDT so it can be used as a Go map key.
+// Pointers are comparable, which map[string]interface{} is not, and gocql asks
+// for each field by name through UDTMarshaler.
+type udtMapKey struct {
+	fields map[string]interface{}
+}
+
+// The receiver is a value, not a pointer: gocql.Marshal dereferences a pointer
+// before it looks for UDTMarshaler, so a pointer receiver is never seen and the
+// UDT silently marshals every field as null.
+var _ gocql.UDTMarshaler = udtMapKey{}
+
+func (k udtMapKey) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) {
+	v, ok := k.fields[name]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	return gocql.Marshal(info, v)
 }

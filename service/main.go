@@ -428,7 +428,7 @@ func (h *Handler) FirstQuery(req *RowTokenReq, schema []map[string]interface{}) 
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
 				{
-					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
 					if err != nil {
 						return nil, fmt.Errorf("%s: %w", columnName, err)
 					}
@@ -439,7 +439,7 @@ func (h *Handler) FirstQuery(req *RowTokenReq, schema []map[string]interface{}) 
 			} else if kind == ClusteringKey {
 				cCqlColumnName = append(cCqlColumnName, columnName)
 				{
-					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
 					if err != nil {
 						return nil, fmt.Errorf("%s: %w", columnName, err)
 					}
@@ -502,7 +502,7 @@ func (h *Handler) SecondQuery(req *RowTokenReq, schema []map[string]interface{},
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
 				{
-					val, err := cqlFormatValue(columnType, req.Item[columnName])
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
 					if err != nil {
 						return nil, fmt.Errorf("%s: %w", columnName, err)
 					}
@@ -665,7 +665,17 @@ func (h *Handler) Save(c echo.Context) error {
 		schema[v["column_name"].(string)] = v["type"].(string)
 	}
 
-	itemKey, itemData, itemPlaceholder, err = InputTransformType(item, schema)
+	// Cassandra rejects INSERT on a counter table; a counter only moves by a
+	// delta, so that row is saved as an UPDATE instead.
+	if hasCounterColumn(schema) {
+		if err := h.saveCounterRow(req.Table, item); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+
+		return c.JSON(http.StatusOK, "success")
+	}
+
+	itemKey, itemData, itemPlaceholder, err = InputTransformType(h.converterFor(req.Table), item, schema)
 
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -718,7 +728,7 @@ func (h *Handler) Delete(c echo.Context) error {
 		columnType := v["type"].(string)
 
 		if kind == PartitionKey {
-			val, err := cqlFormatValue(columnType, item[columnName])
+			val, err := cqlFormatValue(h.converterFor(req.Table), columnType, item[columnName])
 			if err != nil {
 				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 			}
@@ -726,7 +736,7 @@ func (h *Handler) Delete(c echo.Context) error {
 			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
 			partitionValue = append(partitionValue, val)
 		} else if kind == ClusteringKey {
-			val, err := cqlFormatValue(columnType, item[columnName])
+			val, err := cqlFormatValue(h.converterFor(req.Table), columnType, item[columnName])
 			if err != nil {
 				return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 			}
@@ -822,7 +832,7 @@ func (h *Handler) Find(c echo.Context) error {
 				partitionCql = append(partitionCql, cql)
 				for _, v := range value.Array() {
 					{
-						val, err := cqlFormatValue(columnType, v.Value())
+						val, err := cqlFormatValue(h.converterFor(req.Table), columnType, v.Value())
 						if err != nil {
 							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 						}
@@ -833,7 +843,7 @@ func (h *Handler) Find(c echo.Context) error {
 			} else {
 				partitionCql = append(partitionCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
 				{
-					val, err := cqlFormatValue(columnType, req.Item[columnName]["value"])
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName]["value"])
 					if err != nil {
 						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 					}
@@ -862,7 +872,7 @@ func (h *Handler) Find(c echo.Context) error {
 				clusteringCql = append(clusteringCql, cql)
 				for _, v := range value.Array() {
 					{
-						val, err := cqlFormatValue(columnType, v.Value())
+						val, err := cqlFormatValue(h.converterFor(req.Table), columnType, v.Value())
 						if err != nil {
 							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 						}
@@ -873,7 +883,7 @@ func (h *Handler) Find(c echo.Context) error {
 			} else {
 				clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
 				{
-					val, err := cqlFormatValue(columnType, req.Item[columnName]["value"])
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName]["value"])
 					if err != nil {
 						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
 					}
@@ -1102,6 +1112,126 @@ func (h *Handler) Truncate(c echo.Context) error {
 }
 
 // GetSchema 取的table schema
+func hasCounterColumn(schema map[string]string) bool {
+	for _, t := range schema {
+		if t == CounterType {
+			return true
+		}
+	}
+	return false
+}
+
+// saveCounterRow moves each counter by the difference between the submitted
+// value and the stored one, because a counter cannot be assigned outright. The
+// read and the update are not atomic, so a counter written concurrently can
+// land off by the other writer's delta.
+func (h *Handler) saveCounterRow(table string, item map[string]interface{}) error {
+	conv := h.converterFor(table)
+
+	var (
+		whereCql   []string
+		whereValue []interface{}
+		counters   []string
+	)
+
+	for _, v := range h.GetSchema(table) {
+		columnName := v["column_name"].(string)
+		columnType := v["type"].(string)
+
+		if columnType == CounterType {
+			counters = append(counters, columnName)
+			continue
+		}
+
+		kind := v["kind"].(string)
+		if kind != PartitionKey && kind != ClusteringKey {
+			continue
+		}
+
+		val, err := cqlFormatValue(conv, columnType, item[columnName])
+		if err != nil {
+			return fmt.Errorf("%s: %w", columnName, err)
+		}
+
+		whereCql = append(whereCql, cqlFormatWhere(columnName, "="))
+		whereValue = append(whereValue, val)
+	}
+
+	if len(whereCql) == 0 {
+		return fmt.Errorf("cannot update a counter row without its primary key")
+	}
+
+	where := strings.Join(whereCql, " AND ")
+
+	current := make([]int64, len(counters))
+	dest := make([]interface{}, len(counters))
+	for i := range current {
+		dest[i] = &current[i]
+	}
+
+	// A missing row leaves every counter at zero, which is the right base.
+	if err := h.Session.Query(
+		fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(counters, ","), table, where),
+		whereValue...).Scan(dest...); err != nil && err != gocql.ErrNotFound {
+		return fmt.Errorf("read current counters: %w", err)
+	}
+
+	var (
+		setCql   []string
+		setValue []interface{}
+	)
+
+	for i, name := range counters {
+		want, err := toInt64(item[name])
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+
+		if delta := want - current[i]; delta != 0 {
+			setCql = append(setCql, fmt.Sprintf("%s = %s + ?", name, name))
+			setValue = append(setValue, delta)
+		}
+	}
+
+	if len(setCql) == 0 {
+		return nil
+	}
+
+	cql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(setCql, ","), where)
+	log.Info("save counter cql: ", cql, append(setValue, whereValue...))
+
+	if err := h.Session.Query(cql, append(setValue, whereValue...)...).Exec(); err != nil {
+		return fmt.Errorf("update counters: %w", err)
+	}
+	return nil
+}
+
+// UDTFields reads a user-defined type's fields so a write can convert each one
+// against its declared type. Not cached: a UDT can be altered, and a stale
+// entry would bind the wrong types.
+func (h *Handler) UDTFields(keyspace, typeName string) ([]udtField, bool) {
+	var names, types []string
+
+	err := h.Session.Query(
+		`SELECT field_names, field_types FROM system_schema.types WHERE keyspace_name = ? AND type_name = ?`,
+		keyspace, typeName).Scan(&names, &types)
+	if err != nil || len(names) != len(types) {
+		return nil, false
+	}
+
+	fields := make([]udtField, 0, len(names))
+	for i, name := range names {
+		fields = append(fields, udtField{Name: name, Type: types[i]})
+	}
+	return fields, true
+}
+
+// converterFor builds the value conversion for a "keyspace.table" reference.
+func (h *Handler) converterFor(table string) converter {
+	keyspace, _, _ := strings.Cut(table, ".")
+	return converter{keyspace: keyspace, udts: h}
+}
+
 func (h *Handler) GetSchema(table string) []map[string]interface{} {
 	tablekey := strings.Split(table, ".")
 
