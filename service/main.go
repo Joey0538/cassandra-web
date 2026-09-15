@@ -46,12 +46,10 @@ func init() {
 				*(*interface{})(ptr) = i
 				return
 			}
-			f, err := strconv.ParseFloat(string(number), 64)
-			if err == nil {
-				*(*interface{})(ptr) = f
-				return
-			}
-			// Not much we can do here.
+			// Anything wider than an int64 keeps its digits as a
+			// json.Number; going through float64 silently rewrote large
+			// varints and decimals into a different value.
+			*(*interface{})(ptr) = number
 		default:
 			*(*interface{})(ptr) = iter.Read()
 		}
@@ -429,11 +427,25 @@ func (h *Handler) FirstQuery(req *RowTokenReq, schema []map[string]interface{}) 
 
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
-				pCqlColumnValue = append(pCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					pCqlColumnValue = append(pCqlColumnValue, val)
+				}
 				pCqlPlaceholder = append(pCqlPlaceholder, "?")
 			} else if kind == ClusteringKey {
 				cCqlColumnName = append(cCqlColumnName, columnName)
-				cCqlColumnValue = append(cCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					cCqlColumnValue = append(cCqlColumnValue, val)
+				}
 				cCqlPlaceholder = append(cCqlPlaceholder, "?")
 			}
 		}
@@ -489,7 +501,14 @@ func (h *Handler) SecondQuery(req *RowTokenReq, schema []map[string]interface{},
 
 			if kind == PartitionKey {
 				pCqlColumnName = append(pCqlColumnName, columnName)
-				pCqlColumnValue = append(pCqlColumnValue, cqlFormatValue(columnType, req.Item[columnName]))
+				{
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName])
+					if err != nil {
+						return nil, fmt.Errorf("%s: %w", columnName, err)
+					}
+
+					pCqlColumnValue = append(pCqlColumnValue, val)
+				}
 				pCqlPlaceholder = append(pCqlPlaceholder, "?")
 			}
 		}
@@ -646,7 +665,17 @@ func (h *Handler) Save(c echo.Context) error {
 		schema[v["column_name"].(string)] = v["type"].(string)
 	}
 
-	itemKey, itemData, itemPlaceholder, err = InputTransformType(item, schema)
+	// Cassandra rejects INSERT on a counter table; a counter only moves by a
+	// delta, so that row is saved as an UPDATE instead.
+	if hasCounterColumn(schema) {
+		if err := h.saveCounterRow(req.Table, item); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+
+		return c.JSON(http.StatusOK, "success")
+	}
+
+	itemKey, itemData, itemPlaceholder, err = InputTransformType(h.converterFor(req.Table), item, schema)
 
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -686,32 +715,16 @@ func (h *Handler) Delete(c echo.Context) error {
 
 	schema := h.GetSchema(req.Table)
 
-	var (
-		partitionCql    []string
-		clusteringCql   []string
-		partitionValue  []interface{}
-		clusteringValue []interface{}
-	)
-
-	for _, v := range schema {
-		kind := v["kind"].(string)
-		columnName := v["column_name"].(string)
-		columnType := v["type"].(string)
-
-		if kind == PartitionKey {
-			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
-			partitionValue = append(partitionValue, cqlFormatValue(columnType, item[columnName]))
-		} else if kind == ClusteringKey {
-			clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, "="))
-			clusteringValue = append(clusteringValue, cqlFormatValue(columnType, item[columnName]))
-		}
+	where, whereValue, err := deleteWhere(h.converterFor(req.Table), schema, item)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
-	cql := fmt.Sprintf("DELETE FROM %s WHERE %s ", req.Table, strings.Join(append(partitionCql, clusteringCql...), " AND "))
+	cql := fmt.Sprintf("DELETE FROM %s WHERE %s ", req.Table, where)
 
-	log.Info("delete cql: ", cql, append(partitionValue, clusteringValue...))
+	log.Info("delete cql: ", cql, whereValue)
 
-	if err := h.Session.Query(cql, append(partitionValue, clusteringValue...)...).Exec(); err != nil {
+	if err := h.Session.Query(cql, whereValue...).Exec(); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
@@ -792,11 +805,25 @@ func (h *Handler) Find(c echo.Context) error {
 
 				partitionCql = append(partitionCql, cql)
 				for _, v := range value.Array() {
-					partitionValue = append(partitionValue, cqlFormatValue(columnType, v.Value()))
+					{
+						val, err := cqlFormatValue(h.converterFor(req.Table), columnType, v.Value())
+						if err != nil {
+							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+						}
+
+						partitionValue = append(partitionValue, val)
+					}
 				}
 			} else {
 				partitionCql = append(partitionCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
-				partitionValue = append(partitionValue, cqlFormatValue(columnType, req.Item[columnName]["value"]))
+				{
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName]["value"])
+					if err != nil {
+						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+					}
+
+					partitionValue = append(partitionValue, val)
+				}
 			}
 
 		} else if kind == ClusteringKey || req.IsAllowFilter {
@@ -818,11 +845,25 @@ func (h *Handler) Find(c echo.Context) error {
 
 				clusteringCql = append(clusteringCql, cql)
 				for _, v := range value.Array() {
-					clusteringValue = append(clusteringValue, cqlFormatValue(columnType, v.Value()))
+					{
+						val, err := cqlFormatValue(h.converterFor(req.Table), columnType, v.Value())
+						if err != nil {
+							return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+						}
+
+						clusteringValue = append(clusteringValue, val)
+					}
 				}
 			} else {
 				clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, req.Item[columnName]["operator"].(string)))
-				clusteringValue = append(clusteringValue, cqlFormatValue(columnType, req.Item[columnName]["value"]))
+				{
+					val, err := cqlFormatValue(h.converterFor(req.Table), columnType, req.Item[columnName]["value"])
+					if err != nil {
+						return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("%s: %s", columnName, err))
+					}
+
+					clusteringValue = append(clusteringValue, val)
+				}
 			}
 		}
 	}
@@ -1045,6 +1086,236 @@ func (h *Handler) Truncate(c echo.Context) error {
 }
 
 // GetSchema 取的table schema
+// deleteWhere identifies the row to delete. A row is identified by its
+// partition key plus the clustering keys it actually has: the static row left
+// behind when a partition's last clustering row is deleted has none, and CQL
+// rejects a null in a WHERE clause, so those columns are left out instead of
+// bound as null. Deleting that row then removes the whole partition, which is
+// what clears the static columns. Clustering keys stop at the first missing
+// one, because CQL only accepts a contiguous prefix.
+func deleteWhere(conv converter, schema []map[string]interface{}, item map[string]interface{}) (string, []interface{}, error) {
+	var (
+		partitionCql    []string
+		partitionValue  []interface{}
+		clusteringCql   []string
+		clusteringValue []interface{}
+		clusteringEnded bool
+	)
+
+	for _, v := range schema {
+		kind := v["kind"].(string)
+		if kind != PartitionKey && kind != ClusteringKey {
+			continue
+		}
+
+		columnName := v["column_name"].(string)
+		columnType := v["type"].(string)
+
+		val, err := cqlFormatValue(conv, columnType, item[columnName])
+		if err != nil {
+			return "", nil, fmt.Errorf("%s: %w", columnName, err)
+		}
+
+		if kind == PartitionKey {
+			if val == nil {
+				return "", nil, fmt.Errorf("%s: a row cannot be deleted without its partition key", columnName)
+			}
+
+			partitionCql = append(partitionCql, cqlFormatWhere(columnName, "="))
+			partitionValue = append(partitionValue, val)
+			continue
+		}
+
+		if val == nil {
+			clusteringEnded = true
+			continue
+		}
+
+		if clusteringEnded {
+			continue
+		}
+
+		clusteringCql = append(clusteringCql, cqlFormatWhere(columnName, "="))
+		clusteringValue = append(clusteringValue, val)
+	}
+
+	if len(partitionCql) == 0 {
+		return "", nil, fmt.Errorf("a row cannot be deleted without its partition key")
+	}
+
+	return strings.Join(append(partitionCql, clusteringCql...), " AND "),
+		append(partitionValue, clusteringValue...), nil
+}
+
+// counterAttempts bounds the read-apply-recheck loop in convergeCounters.
+const counterAttempts = 3
+
+// convergeCounters brings each counter to want. Cassandra has no way to do this
+// atomically - "counters can only be incremented/decremented, not set", and
+// "Conditions on counters are not supported" rules out a compare-and-set - so
+// the difference is applied and the result re-read. A writer landing in that
+// window used to leave the counter silently wrong; now the remaining difference
+// is applied on the next pass, and a counter that never settles is reported
+// rather than called a success.
+func convergeCounters(want []int64, read func() ([]int64, error), apply func(deltas []int64) error, attempts int) error {
+	for attempt := 0; attempt < attempts; attempt++ {
+		current, err := read()
+		if err != nil {
+			return fmt.Errorf("read current counters: %w", err)
+		}
+		if len(current) != len(want) {
+			return fmt.Errorf("read %d counters, expected %d", len(current), len(want))
+		}
+
+		deltas := make([]int64, len(want))
+		settled := true
+
+		for i := range want {
+			deltas[i] = want[i] - current[i]
+			if deltas[i] != 0 {
+				settled = false
+			}
+		}
+
+		if settled {
+			return nil
+		}
+
+		if err := apply(deltas); err != nil {
+			return err
+		}
+	}
+
+	return fmt.Errorf("counter did not settle after %d attempts; it is being written concurrently", attempts)
+}
+
+func hasCounterColumn(schema map[string]string) bool {
+	for _, t := range schema {
+		if t == CounterType {
+			return true
+		}
+	}
+	return false
+}
+
+// saveCounterRow brings each counter to the submitted value, because a counter
+// cannot be assigned outright. See convergeCounters for why that takes a loop.
+func (h *Handler) saveCounterRow(table string, item map[string]interface{}) error {
+	conv := h.converterFor(table)
+
+	var (
+		whereCql   []string
+		whereValue []interface{}
+		counters   []string
+	)
+
+	for _, v := range h.GetSchema(table) {
+		columnName := v["column_name"].(string)
+		columnType := v["type"].(string)
+
+		if columnType == CounterType {
+			counters = append(counters, columnName)
+			continue
+		}
+
+		kind := v["kind"].(string)
+		if kind != PartitionKey && kind != ClusteringKey {
+			continue
+		}
+
+		val, err := cqlFormatValue(conv, columnType, item[columnName])
+		if err != nil {
+			return fmt.Errorf("%s: %w", columnName, err)
+		}
+
+		whereCql = append(whereCql, cqlFormatWhere(columnName, "="))
+		whereValue = append(whereValue, val)
+	}
+
+	if len(whereCql) == 0 {
+		return fmt.Errorf("cannot update a counter row without its primary key")
+	}
+
+	where := strings.Join(whereCql, " AND ")
+
+	want := make([]int64, len(counters))
+	for i, name := range counters {
+		v, err := toInt64(item[name])
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		want[i] = v
+	}
+
+	selectCql := fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(counters, ","), table, where)
+
+	read := func() ([]int64, error) {
+		current := make([]int64, len(counters))
+		dest := make([]interface{}, len(counters))
+		for i := range current {
+			dest[i] = &current[i]
+		}
+
+		// A missing row leaves every counter at zero, which is the right base.
+		if err := h.Session.Query(selectCql, whereValue...).Scan(dest...); err != nil && err != gocql.ErrNotFound {
+			return nil, err
+		}
+		return current, nil
+	}
+
+	apply := func(deltas []int64) error {
+		var (
+			setCql   []string
+			setValue []interface{}
+		)
+
+		for i, name := range counters {
+			if deltas[i] == 0 {
+				continue
+			}
+
+			setCql = append(setCql, fmt.Sprintf("%s = %s + ?", name, name))
+			setValue = append(setValue, deltas[i])
+		}
+
+		cql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(setCql, ","), where)
+		log.Info("save counter cql: ", cql, append(setValue, whereValue...))
+
+		if err := h.Session.Query(cql, append(setValue, whereValue...)...).Exec(); err != nil {
+			return fmt.Errorf("update counters: %w", err)
+		}
+		return nil
+	}
+
+	return convergeCounters(want, read, apply, counterAttempts)
+}
+
+// UDTFields reads a user-defined type's fields so a write can convert each one
+// against its declared type. Not cached: a UDT can be altered, and a stale
+// entry would bind the wrong types.
+func (h *Handler) UDTFields(keyspace, typeName string) ([]udtField, bool) {
+	var names, types []string
+
+	err := h.Session.Query(
+		`SELECT field_names, field_types FROM system_schema.types WHERE keyspace_name = ? AND type_name = ?`,
+		keyspace, typeName).Scan(&names, &types)
+	if err != nil || len(names) != len(types) {
+		return nil, false
+	}
+
+	fields := make([]udtField, 0, len(names))
+	for i, name := range names {
+		fields = append(fields, udtField{Name: name, Type: types[i]})
+	}
+	return fields, true
+}
+
+// converterFor builds the value conversion for a "keyspace.table" reference.
+func (h *Handler) converterFor(table string) converter {
+	keyspace, _, _ := strings.Cut(table, ".")
+	return converter{keyspace: keyspace, udts: h}
+}
+
 func (h *Handler) GetSchema(table string) []map[string]interface{} {
 	tablekey := strings.Split(table, ".")
 

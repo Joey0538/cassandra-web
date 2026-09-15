@@ -237,7 +237,9 @@ export default {
           this.rowData = rows.map((row) => {
             const item = row
             forEach(item, (itemData, itemKey) => {
-              if (typeof (itemData) === 'object') {
+              // typeof null is 'object', and stringifying it turns an unset
+              // column into the literal text "null" when the row is saved back.
+              if (itemData !== null && typeof (itemData) === 'object') {
                 item[itemKey] = JSONbig.stringify(itemData)
               } else {
                 item[itemKey] = itemData
