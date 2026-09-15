@@ -1147,6 +1147,48 @@ func deleteWhere(conv converter, schema []map[string]interface{}, item map[strin
 		append(partitionValue, clusteringValue...), nil
 }
 
+// counterAttempts bounds the read-apply-recheck loop in convergeCounters.
+const counterAttempts = 3
+
+// convergeCounters brings each counter to want. Cassandra has no way to do this
+// atomically - "counters can only be incremented/decremented, not set", and
+// "Conditions on counters are not supported" rules out a compare-and-set - so
+// the difference is applied and the result re-read. A writer landing in that
+// window used to leave the counter silently wrong; now the remaining difference
+// is applied on the next pass, and a counter that never settles is reported
+// rather than called a success.
+func convergeCounters(want []int64, read func() ([]int64, error), apply func(deltas []int64) error, attempts int) error {
+	for attempt := 0; attempt < attempts; attempt++ {
+		current, err := read()
+		if err != nil {
+			return fmt.Errorf("read current counters: %w", err)
+		}
+		if len(current) != len(want) {
+			return fmt.Errorf("read %d counters, expected %d", len(current), len(want))
+		}
+
+		deltas := make([]int64, len(want))
+		settled := true
+
+		for i := range want {
+			deltas[i] = want[i] - current[i]
+			if deltas[i] != 0 {
+				settled = false
+			}
+		}
+
+		if settled {
+			return nil
+		}
+
+		if err := apply(deltas); err != nil {
+			return err
+		}
+	}
+
+	return fmt.Errorf("counter did not settle after %d attempts; it is being written concurrently", attempts)
+}
+
 func hasCounterColumn(schema map[string]string) bool {
 	for _, t := range schema {
 		if t == CounterType {
@@ -1156,10 +1198,8 @@ func hasCounterColumn(schema map[string]string) bool {
 	return false
 }
 
-// saveCounterRow moves each counter by the difference between the submitted
-// value and the stored one, because a counter cannot be assigned outright. The
-// read and the update are not atomic, so a counter written concurrently can
-// land off by the other writer's delta.
+// saveCounterRow brings each counter to the submitted value, because a counter
+// cannot be assigned outright. See convergeCounters for why that takes a loop.
 func (h *Handler) saveCounterRow(table string, item map[string]interface{}) error {
 	conv := h.converterFor(table)
 
@@ -1198,47 +1238,56 @@ func (h *Handler) saveCounterRow(table string, item map[string]interface{}) erro
 
 	where := strings.Join(whereCql, " AND ")
 
-	current := make([]int64, len(counters))
-	dest := make([]interface{}, len(counters))
-	for i := range current {
-		dest[i] = &current[i]
-	}
-
-	// A missing row leaves every counter at zero, which is the right base.
-	if err := h.Session.Query(
-		fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(counters, ","), table, where),
-		whereValue...).Scan(dest...); err != nil && err != gocql.ErrNotFound {
-		return fmt.Errorf("read current counters: %w", err)
-	}
-
-	var (
-		setCql   []string
-		setValue []interface{}
-	)
-
+	want := make([]int64, len(counters))
 	for i, name := range counters {
-		want, err := toInt64(item[name])
+		v, err := toInt64(item[name])
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
-
-		if delta := want - current[i]; delta != 0 {
-			setCql = append(setCql, fmt.Sprintf("%s = %s + ?", name, name))
-			setValue = append(setValue, delta)
-		}
+		want[i] = v
 	}
 
-	if len(setCql) == 0 {
+	selectCql := fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(counters, ","), table, where)
+
+	read := func() ([]int64, error) {
+		current := make([]int64, len(counters))
+		dest := make([]interface{}, len(counters))
+		for i := range current {
+			dest[i] = &current[i]
+		}
+
+		// A missing row leaves every counter at zero, which is the right base.
+		if err := h.Session.Query(selectCql, whereValue...).Scan(dest...); err != nil && err != gocql.ErrNotFound {
+			return nil, err
+		}
+		return current, nil
+	}
+
+	apply := func(deltas []int64) error {
+		var (
+			setCql   []string
+			setValue []interface{}
+		)
+
+		for i, name := range counters {
+			if deltas[i] == 0 {
+				continue
+			}
+
+			setCql = append(setCql, fmt.Sprintf("%s = %s + ?", name, name))
+			setValue = append(setValue, deltas[i])
+		}
+
+		cql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(setCql, ","), where)
+		log.Info("save counter cql: ", cql, append(setValue, whereValue...))
+
+		if err := h.Session.Query(cql, append(setValue, whereValue...)...).Exec(); err != nil {
+			return fmt.Errorf("update counters: %w", err)
+		}
 		return nil
 	}
 
-	cql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(setCql, ","), where)
-	log.Info("save counter cql: ", cql, append(setValue, whereValue...))
-
-	if err := h.Session.Query(cql, append(setValue, whereValue...)...).Exec(); err != nil {
-		return fmt.Errorf("update counters: %w", err)
-	}
-	return nil
+	return convergeCounters(want, read, apply, counterAttempts)
 }
 
 // UDTFields reads a user-defined type's fields so a write can convert each one

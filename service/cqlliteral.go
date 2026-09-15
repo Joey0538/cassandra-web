@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -36,7 +37,16 @@ func (c converter) literal(cqlType string, v interface{}) (string, error) {
 	}
 
 	switch baseCQLType(cqlType) {
-	case TextType, VarcharType, AsciiType, InetType, DateType:
+	case InetType:
+		// inet is the one literal whose text comes from the user, so it is
+		// checked to be an address rather than trusted to be harmless quoted.
+		s, _ := converted.(string)
+		if net.ParseIP(s) == nil {
+			return "", fmt.Errorf("%q is not a valid inet address", s)
+		}
+		return quoteCQLString(s), nil
+
+	case TextType, VarcharType, AsciiType, DateType:
 		s, ok := converted.(string)
 		if !ok {
 			return "", fmt.Errorf("cannot render %T as %s", converted, cqlType)

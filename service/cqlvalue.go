@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -344,12 +345,22 @@ func (c converter) value(cqlType string, v interface{}) (interface{}, error) {
 	}
 
 	switch baseCQLType(cqlType) {
-	case AsciiType, TextType, VarcharType, InetType, UuidType, TimeuuidType:
+	case AsciiType, TextType, VarcharType, UuidType, TimeuuidType:
 		s, ok := numericString(v)
 		if !ok {
 			return nil, fmt.Errorf("cannot read %T as %s", v, cqlType)
 		}
 		return s, nil
+
+	case InetType:
+		s, ok := numericString(v)
+		if !ok {
+			return nil, fmt.Errorf("cannot read %T as an inet address", v)
+		}
+		if net.ParseIP(strings.TrimSpace(s)) == nil {
+			return nil, fmt.Errorf("%q is not a valid inet address", s)
+		}
+		return strings.TrimSpace(s), nil
 
 	case BooleanType:
 		switch b := v.(type) {
