@@ -45,6 +45,16 @@ func baseCQLType(cqlType string) string {
 	if i := strings.IndexByte(t, '<'); i >= 0 {
 		return strings.TrimSpace(t[:i])
 	}
+	return unquoteCQLIdentifier(t)
+}
+
+// unquoteCQLIdentifier drops the double quotes a case-sensitive name carries.
+// system_schema reports such a column as frozen<"EncMeta">, while the lookup
+// key in system_schema.types is the bare EncMeta.
+func unquoteCQLIdentifier(t string) string {
+	if len(t) >= 2 && strings.HasPrefix(t, `"`) && strings.HasSuffix(t, `"`) {
+		return strings.ReplaceAll(t[1:len(t)-1], `""`, `"`)
+	}
 	return t
 }
 
@@ -341,6 +351,14 @@ func asStringMap(v interface{}) (map[string]interface{}, error) {
 // a delete can never disagree about what a column's value means.
 func (c converter) value(cqlType string, v interface{}) (interface{}, error) {
 	if isBlank(v) {
+		// gocql rejects an untyped nil for a UDT - "cannot marshal <nil> into
+		// chat.EncMeta{nonce=blob}" - because its reflect path sees an invalid
+		// Kind. A typed nil pointer takes the IsNil branch in gocql.Marshal and
+		// binds NULL, which is what an emptied column should write.
+		if _, ok := c.udtFields(cqlType); ok {
+			return nilUDT, nil
+		}
+
 		return nil, nil
 	}
 
@@ -550,3 +568,6 @@ func (k udtMapKey) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) 
 	}
 	return gocql.Marshal(info, v)
 }
+
+// nilUDT binds NULL for a user-defined type. See converter.value.
+var nilUDT = (*map[string]interface{})(nil)
