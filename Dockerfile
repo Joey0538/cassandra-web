@@ -42,7 +42,13 @@ FROM alpine:3.24.1
 # Backs the UI's export/import buttons. gcompat is for these two glibc-linked
 # binaries, not for the Go service.
 ADD https://github.com/masumsoft/cassandra-exporter/releases/download/v1.0.4/cassandra-exporter-linux.zip /tmp/cassandra-exporter.zip
-RUN apk add --no-cache gcompat unzip \
+# The alpine:3.24.1 tag still ships openssl 3.5.7-r0. CVE-2026-75803 (AEAD tag
+# verification skipped for an empty ciphertext, CVSS 9.1) and CVE-2026-63073
+# (attacker-controlled format string in CMP response validation) are both fixed
+# in Alpine's openssl 3.5.8-r0, which is published to the 3.24 branch but not
+# yet in a rebuilt base image, so it is pulled in here rather than waited for.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache gcompat unzip \
     && unzip /tmp/cassandra-exporter.zip -d /tmp \
     && mv /tmp/cassandra-exporter-linux/export-linux /sbin/cexport \
     && mv /tmp/cassandra-exporter-linux/import-linux /sbin/cimport \
